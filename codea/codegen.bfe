@@ -1,0 +1,357 @@
+%{
+
+#include "common.h"
+#include <assert.h>
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+
+#define LEFT_CHILD(tree)  ((tree)->kids[0])
+#define RIGHT_CHILD(tree) ((tree)->kids[1])
+#define OP_LABEL(tree)    ((tree)->operator)
+#define STATE_LABEL(tree) ((tree)->state)
+
+#define PANIC(...) (void) fprintf(stderr, __VA_ARGS__);
+
+int
+yyparse(void);
+
+void
+burm_reduce(NODEPTR_TYPE bnode, int goalnt);
+
+static
+void free_register(int reg);
+
+static
+int new_register(void);
+
+static void
+generate_return(struct ast_node *node, struct ast_node *child);
+
+static void
+generate_arithmetic_operator(struct ast_node *node, struct ast_node *left,
+        struct ast_node *right);
+
+static void
+generate_compare_operator(struct ast_node *node, struct ast_node *left,
+        struct ast_node *right);
+
+static void
+generate_unary_operator(struct ast_node *node, struct ast_node *child);
+
+static void
+generate_read(struct ast_node *node, struct ast_node *child);
+
+static const char *
+register_name(int reg);
+
+%}
+
+%start func
+%term ADD=1 CONST=2 EQ=3 FUNC=4 LT=5 MUL=6 NEG=7 NOT=8 OR=9 READ=10 RETURN=11 WRITE=12 VAR=13
+
+%%
+
+func:   FUNC(return)    # 0 #
+return: RETURN(expr)    # 1 # generate_return(bnode, kids[0]);
+expr:   ADD(expr, expr) # 1 # generate_arithmetic_operator(bnode, kids[0], kids[1]);
+expr:   MUL(expr, expr) # 1 # generate_arithmetic_operator(bnode, kids[0], kids[1]);
+expr:   OR(expr, expr)  # 1 # generate_arithmetic_operator(bnode, kids[0], kids[1]);
+expr:   EQ(expr, expr)  # 1 # generate_compare_operator(bnode, kids[0], kids[1]);
+expr:   LT(expr, expr)  # 1 # generate_compare_operator(bnode, kids[0], kids[1]);
+expr:   NEG(expr)       # 1 # generate_unary_operator(bnode, kids[0]);
+expr:   NOT(expr)       # 1 # generate_unary_operator(bnode, kids[0]);
+expr:   READ(expr)      # 1 # generate_read(bnode, kids[0]);
+expr:   CONST           # 0 #
+expr:   VAR             # 0 #
+
+%%
+
+static long registers;
+
+void
+free_register(int reg)
+{
+    assert(reg >= REG_START);
+    assert(reg <= REG_END);
+    registers &= ~(1 << reg);
+}
+
+int
+new_register(void)
+{
+    size_t reg;
+    assert(REG_START >= 0);
+    assert(REG_END < sizeof(registers) * 8);
+    for (reg = REG_END; reg >= REG_START; --reg) {
+        if ((registers & (1 << reg)) == 0) {
+            registers |= (1 << reg);
+            return reg;
+        }
+    }
+    (void) fputs("No more free registers\n", stderr);
+    exit(4);
+}
+
+void
+generate_function(struct ast_node *root)
+{
+    assert(root != NULL);
+    assert(root->operator == OP_FUNC);
+    registers = root->value;
+    (void) printf(".text\n.global %s\n.type %s, @function\n%s:\n", root->string,
+            root->string, root->string);
+    burm_label(root);
+    burm_reduce(root, 1);
+    printf(".size %s, .-%s\n\n", root->string, root->string);
+}
+
+void
+generate_return(struct ast_node *node, struct ast_node *child)
+{
+    assert(node != NULL);
+    assert(child != NULL);
+    /* The function should be called only with following operators. */
+    assert(node->operator == OP_RETURN);
+    if (child->operator == OP_CONST) {
+        (void) printf("  movq  $%li, %%rax\n", child->value);
+    } else if (child->reg != REG_RAX) {
+        (void) printf("  movq  %%%s, %%rax\n", register_name(child->reg));
+    }
+    (void) puts("  ret");
+    free_register(REG_RAX);
+}
+
+#define CONST_TOO_BIG(value) ((value) < INT32_MIN || (value) > INT32_MAX)
+
+#define SWAP(a, b) do {    \
+    __typeof__(a) tmp = a; \
+    a = b;                 \
+    b = tmp;               \
+} while (0)
+
+void
+generate_arithmetic_operator(struct ast_node *node, struct ast_node *left,
+        struct ast_node *right)
+{
+    const char *opcode;
+    assert(node != NULL);
+    assert(left != NULL);
+    assert(right != NULL);
+    /* The function should be called only with following operators. */
+    assert(node->operator == OP_ADD || node->operator == OP_MUL ||
+            node->operator == OP_OR);
+    /* Should be already folded in ast. */
+    assert(left->operator != OP_CONST || right->operator != OP_CONST);
+    /* Prefer const and var on rhs. */
+    if (left->operator == OP_CONST ||
+            (left->operator == OP_VAR && right->operator != OP_CONST)) {
+        SWAP(left, right);
+    }
+    if (right->operator == OP_CONST && CONST_TOO_BIG(right->value)) {
+        /* There is no add/mul/or instruction with imm64. */
+        node->reg = new_register();
+        (void) printf("  movq  $%li, %%%s\n", right->value,
+                register_name(node->reg));
+        SWAP(left, right);
+    } else if (left->operator == OP_VAR) {
+        /* Must use another register. */
+        assert(right->operator == OP_CONST || right->operator == OP_VAR);
+        node->reg = new_register();
+        /* Special case for 3 param imulq. */
+        if (node->operator == OP_MUL && right->operator == OP_CONST) {
+            assert(!CONST_TOO_BIG(right->value));
+            (void) printf("  imulq $%li, %%%s, %%%s\n", right->value,
+                    register_name(left->reg), register_name(node->reg));
+            return;
+        }
+        /* Copy the variable into the new register. */
+        (void) printf("  movq  %%%s, %%%s\n", register_name(left->reg),
+                register_name(node->reg));
+    } else {
+        /* The lhs is another expression, just use the register. */
+        assert(left->operator != OP_CONST && left->operator != OP_VAR);
+        node->reg = left->reg;
+    }
+    /* Select an opcode for the operator. */
+    switch (node->operator) {
+    case OP_ADD:
+        opcode = "addq ";
+        break;
+    case OP_MUL:
+        opcode = "imulq";
+        break;
+    case OP_OR:
+        opcode = "orq  ";
+        break;
+    default:
+        /* UNREACHABLE */
+        assert(0);
+    }
+    /* Generate an instruction. */
+    if (right->operator == OP_CONST) {
+        assert(!CONST_TOO_BIG(right->value));
+        (void) printf("  %s $%li, %%%s\n", opcode, right->value,
+                register_name(node->reg));
+    } else {
+        (void) printf("  %s %%%s, %%%s\n", opcode, register_name(right->reg),
+                register_name(node->reg));
+        if (right->operator != OP_VAR) {
+            free_register(right->reg);
+        }
+    }
+}
+
+void
+generate_compare_operator(struct ast_node *node, struct ast_node *left,
+        struct ast_node *right)
+{
+    const char *opcode;
+    bool       changed;
+    assert(node != NULL);
+    assert(left != NULL);
+    assert(right != NULL);
+    /* The function should be called only with following operators. */
+    assert(node->operator == OP_EQ || node->operator == OP_LT);
+    /* Should be already folded in ast. */
+    assert(left->operator != OP_CONST || right->operator != OP_CONST);
+    /* Prefer const and var on rhs. */
+    changed = false;
+    if (left->operator == OP_CONST ||
+            (left->operator == OP_VAR && right->operator != OP_CONST)) {
+        SWAP(left, right);
+        changed = !changed;
+    }
+    assert(left->operator != OP_CONST);
+    if (right->operator == OP_CONST && CONST_TOO_BIG(right->value)) {
+        /* There is no cmp instruction with imm64. */
+        node->reg = new_register();
+        (void) printf("  movq  $%li, %%%s\n", right->value,
+                register_name(node->reg));
+        SWAP(left, right);
+        changed = !changed;
+        /* Use this register also when compare. */
+        left->reg = node->reg;
+    } else if (left->operator == OP_VAR) {
+        /* Must use another register. */
+        assert(right->operator == OP_CONST || right->operator == OP_VAR);
+        node->reg = new_register();
+    } else {
+        /* The lhs is another expression, just use the register. */
+        assert(left->operator != OP_CONST && left->operator != OP_VAR);
+        node->reg = left->reg;
+    }
+    /* Generate instructions. */
+    if (right->operator == OP_CONST) {
+        assert(!CONST_TOO_BIG(right->value));
+        (void) printf("  cmpq  $%li, %%%s\n", right->value,
+                register_name(left->reg));
+    } else {
+        (void) printf("  cmpq  %%%s, %%%s\n", register_name(right->reg),
+                register_name(left->reg));
+        if (right->operator != OP_VAR) {
+            free_register(right->reg);
+        }
+    }
+    (void) printf("  movq  $0, %%%s\n", register_name(node->reg));
+    /* Select an opcode. */
+    if (node->operator == OP_EQ) {
+        opcode = "jne  ";
+    } else if (changed) {
+        opcode = "jng  ";
+    } else {
+        opcode = "jnl  ";
+    }
+    (void) printf("  %s .+5\n", opcode);
+    (void) printf("  notq  %%%s\n", register_name(node->reg));
+}
+
+void
+generate_unary_operator(struct ast_node *node, struct ast_node *child)
+{
+    const char *opcode;
+    assert(node != NULL);
+    assert(child != NULL);
+    /* The function should be called only with following operators. */
+    assert(node->operator == OP_NEG || node->operator == OP_NOT);
+    /* Should be already folded in ast. */
+    assert(child->operator != OP_CONST);
+    if (child->operator == OP_VAR) {
+        node->reg = new_register();
+        (void) printf("  movq  %%%s, %%%s\n", register_name(child->reg),
+                register_name(node->reg));
+    } else {
+        node->reg = child->reg;
+    }
+    /* Select an opcode for the operator. */
+    switch (node->operator) {
+    case OP_NEG:
+        opcode = "negq ";
+        break;
+    case OP_NOT:
+        opcode = "notq ";
+        break;
+    default:
+        /* UNREACHABLE */
+        assert(0);
+    }
+    /* Generate an instruction. */
+    (void) printf("  %s %%%s\n", opcode, register_name(node->reg));
+}
+
+void
+generate_read(struct ast_node *node, struct ast_node *child)
+{
+    assert(node != NULL);
+    assert(child != NULL);
+    /* The function should be called only with following operators. */
+    assert(node->operator == OP_READ);
+    if (child->operator == OP_CONST || child->operator == OP_VAR) {
+        node->reg = new_register();
+    } else {
+        node->reg = child->reg;
+    }
+    if (child->operator == OP_CONST && CONST_TOO_BIG(child->value)) {
+        (void) printf("  movq  $%li, %%%s\n", child->value,
+                register_name(node->reg));
+        (void) printf("  movq  (%%%s), %%%s\n", register_name(node->reg),
+                register_name(node->reg));
+    } else if (child->operator == OP_CONST) {
+        (void) printf("  movq  %li, %%%s\n", child->value,
+                register_name(node->reg));
+    } else {
+        (void) printf("  movq  (%%%s), %%%s\n", register_name(child->reg),
+                register_name(node->reg));
+    }
+}
+
+const char *
+register_name(int reg)
+{
+    switch (reg) {
+    case REG_RDI:
+        return "rdi";
+    case REG_RSI:
+        return "rsi";
+    case REG_RDX:
+        return "rdx";
+    case REG_RCX:
+        return "rcx";
+    case REG_R8:
+        return "r8";
+    case REG_R9:
+        return "r9";
+    case REG_R10:
+        return "r10";
+    case REG_R11:
+        return "r11";
+    case REG_RAX:
+        return "rax";
+    default:
+        /* UNREACHABLE */
+        assert(0);
+        return "<unknown register>";
+    }
+}

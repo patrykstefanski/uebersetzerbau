@@ -1,0 +1,999 @@
+%{
+
+#include "common.h"
+#include <assert.h>
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdio.h>
+#include <stdlib.h>
+
+#define LEFT_CHILD(tree)  ((tree)->kids[0])
+#define RIGHT_CHILD(tree) ((tree)->kids[1])
+#define OP_LABEL(tree)    ((tree)->operator)
+#define STATE_LABEL(tree) ((tree)->state)
+
+#define PANIC(...) (void) fprintf(stderr, __VA_ARGS__);
+
+int
+yyparse(void);
+
+void
+burm_reduce(NODEPTR_TYPE bnode, int goalnt);
+
+static int  reg_reg[REG_END - REG_START + 1];
+static bool reg_used[REG_END - REG_START + 1];
+
+static void
+init_registers(size_t used, size_t start)
+{
+    size_t i = 0;
+    int r;
+    for (r = REG_END; r >= REG_START; --r, ++i) {
+        reg_reg[i] = r;
+        reg_used[i] = !!(used & (1 << r));
+    }
+    for (i = REG_END - start; i > 0; --i) {
+        reg_reg[i] = reg_reg[i - 1];
+        reg_used[i] = reg_used[i - 1];
+    }
+    reg_reg[0] = start;
+    reg_used[0] = false;
+}
+
+static void
+free_register(int reg)
+{
+    size_t i;
+    for (i = 0; i < REG_END - REG_START + 1; ++i) {
+        if (reg_reg[i] == reg) {
+            reg_used[i] = false;
+            return;
+        }
+    }
+    assert(0 && "Wrong reg");
+}
+
+static int
+new_register(void)
+{
+    size_t i;
+    for (i = 0; i < REG_END - REG_START + 1; ++i) {
+        if (!reg_used[i]) {
+            reg_used[i] = true;
+            return reg_reg[i];
+        }
+    }
+    fputs("No more free registers\n", stderr);
+    exit(4);
+}
+
+static const char *
+register_name(int reg)
+{
+    switch (reg) {
+    case REG_RDI:
+        return "rdi";
+    case REG_RSI:
+        return "rsi";
+    case REG_RDX:
+        return "rdx";
+    case REG_RCX:
+        return "rcx";
+    case REG_R8:
+        return "r8";
+    case REG_R9:
+        return "r9";
+    case REG_R10:
+        return "r10";
+    case REG_R11:
+        return "r11";
+    case REG_RAX:
+        return "rax";
+    default:
+        /* UNREACHABLE */
+        assert(0);
+        return "<unknown register>";
+    }
+}
+
+#define ADD_I_R(i, r)         printf("  addq    $%li, %%%s\n", (i), register_name(r))
+#define ADD_R_R(r1, r2)       printf("  addq    %%%s, %%%s\n", register_name(r1), register_name(r2))
+#define CMOVG_neg1_R(r)       printf("  cmovgq  .const_neg1(%%rip), %%%s\n", register_name(r));
+#define CMOVL_neg1_R(r)       printf("  cmovlq  .const_neg1(%%rip), %%%s\n", register_name(r));
+#define CMOVNE_1_R(r)         printf("  cmovneq .const_1(%%rip), %%%s\n", register_name(r));
+#define CMP_I_R(i, r)         printf("  cmpq    $%li, %%%s\n", (i), register_name(r))
+#define CMP_R_R(r1, r2)       printf("  cmpq    %%%s, %%%s\n", register_name(r1), register_name(r2))
+#define DEC_R(r)              printf("  decq    %%%s\n", register_name(r))
+#define IMUL_I_R(i, r)        printf("  imulq   $%li, %%%s\n", (i), register_name(r))
+#define IMUL_R_R(r1, r2)      printf("  imulq   %%%s, %%%s\n", register_name(r1), register_name(r2))
+#define IMUL_I_R_R(i, r1, r2) printf("  imulq   $%li, %%%s, %%%s\n", (i), register_name(r1), register_name(r2))
+#define JMP(l, n, f)          printf("  jmp     %s%s%s%zu%c\n", l ? "." : "", l ? l : "", l ? "_" : "", n, f ? 'f' : 'b')
+#define JNG(l, n, f)          printf("  jng     %s%s%s%zu%c\n", l ? "." : "", l ? l : "", l ? "_" : "", n, f ? 'f' : 'b')
+#define JNL(l, n, f)          printf("  jnl     %s%s%s%zu%c\n", l ? "." : "", l ? l : "", l ? "_" : "", n, f ? 'f' : 'b')
+#define JNE(l, n, f)          printf("  jne     %s%s%s%zu%c\n", l ? "." : "", l ? l : "", l ? "_" : "", n, f ? 'f' : 'b')
+#define JNS(l, n, f)          printf("  jns     %s%s%s%zu%c\n", l ? "." : "", l ? l : "", l ? "_" : "", n, f ? 'f' : 'b')
+#define LEA_MRR_R(r1, r2, r3) printf("  leaq    (%%%s, %%%s), %%%s\n", register_name(r1), register_name(r2), register_name(r3))
+#define LEA_MIR_R(i, r1, r2)  printf("  leaq    %li(%%%s), %%%s\n", i, register_name(r1), register_name(r2))
+#define MOV_I_MIR(i1, i2, r)  printf("  movq    $%li, %li(%%%s)\n", (i1), (i2), register_name(r))
+#define MOV_I_MR(i, r)        printf("  movq    $%li, (%%%s)\n", (i), register_name(r))
+#define MOV_I_MRR(i, r1, r2)  printf("  movq    $%li, (%%%s, %%%s)\n", (i), register_name(r1), register_name(r2))
+#define MOV_I_R(i, r)         printf("  movq    $%li, %%%s\n", (i), register_name(r))
+#define MOV_MIR_R(i, r1, r2)  printf("  movq    %li(%%%s), %%%s\n", (i), register_name(r1), register_name(r2))
+#define MOV_MI_R(i, r)        printf("  movq    %li, %%%s\n", (i), register_name(r))
+#define MOV_MRR_R(r1, r2, r3) printf("  movq    (%%%s, %%%s), %%%s\n", register_name(r1), register_name(r2), register_name(r3))
+#define MOV_MR_R(r1, r2)      printf("  movq    (%%%s), %%%s\n", register_name(r1), register_name(r2))
+#define MOV_R_MI(r, i)        printf("  movq    %%%s, %li\n", register_name(r), (i))
+#define MOV_R_MIR(r1, i, r2)  printf("  movq    %%%s, %li(%%%s)\n", register_name(r1), (i), register_name(r2))
+#define MOV_R_MRR(r1, r2, r3) printf("  movq    %%%s, (%%%s, %%%s)\n", register_name(r1), register_name(r2), register_name(r3))
+#define MOV_R_MR(r1, r2)      printf("  movq    %%%s, (%%%s)\n", register_name(r1), register_name(r2))
+#define MOV_R_R(r1, r2)       printf("  movq    %%%s, %%%s\n", register_name(r1), register_name(r2))
+#define NEG_R(r)              printf("  negq    %%%s\n", register_name(r))
+#define NOT_R(r)              printf("  notq    %%%s\n", register_name(r))
+#define OR_I_R(i, r)          printf("  orq     $%li, %%%s\n", (i), register_name(r))
+#define OR_R_R(r1, r2)        printf("  orq     %%%s, %%%s\n", register_name(r1), register_name(r2))
+#define RET()                 printf("  ret\n");
+#define SUB_I_R(i, r)         printf("  subq    $%li, %%%s\n", (i), register_name(r))
+#define SUB_R_R(r1, r2)       printf("  subq    %%%s, %%%s\n", register_name(r1), register_name(r2))
+#define TEST_R_R(r1, r2)      printf("  testq   %%%s, %%%s\n", register_name(r1), register_name(r2))
+
+/* add */
+
+static void
+add_bigconst_expr(struct ast_node *node, struct ast_node *left, struct ast_node *right)
+{
+    int r = new_register();
+    node->reg = right->reg;
+    MOV_I_R(left->value, r);
+    ADD_R_R(r, node->reg);
+    free_register(r);
+}
+
+static void
+add_bigconst_var(struct ast_node *node, struct ast_node *left, struct ast_node *right)
+{
+    node->reg = new_register();
+    MOV_I_R(left->value, node->reg);
+    ADD_R_R(right->reg, node->reg);
+}
+
+static void
+add_const_expr(struct ast_node *node, struct ast_node *left, struct ast_node *right)
+{
+    node->reg = right->reg;
+    ADD_I_R(left->value, node->reg);
+}
+
+static void
+add_const_var(struct ast_node *node, struct ast_node *left, struct ast_node *right)
+{
+    node->reg = new_register();
+    LEA_MIR_R(left->value, right->reg, node->reg);
+}
+
+static void
+add_expr_expr(struct ast_node *node, struct ast_node *left, struct ast_node *right)
+{
+    node->reg = left->reg;
+    ADD_R_R(right->reg, node->reg);
+    free_register(right->reg);
+}
+
+static void
+add_expr_var(struct ast_node *node, struct ast_node *left, struct ast_node *right)
+{
+    node->reg = left->reg;
+    ADD_R_R(right->reg, node->reg);
+}
+
+static void
+add_var_var(struct ast_node *node, struct ast_node *left, struct ast_node *right)
+{
+    node->reg = new_register();
+    LEA_MRR_R(left->reg, right->reg, node->reg);
+}
+
+/* mul */
+
+static void
+mul_bigconst_expr(struct ast_node *node, struct ast_node *left, struct ast_node *right)
+{
+    int r = new_register();
+    node->reg = right->reg;
+    MOV_I_R(left->value, r);
+    IMUL_R_R(r, node->reg);
+    free_register(r);
+}
+
+static void
+mul_bigconst_var(struct ast_node *node, struct ast_node *left, struct ast_node *right)
+{
+    node->reg = new_register();
+    MOV_I_R(left->value, node->reg);
+    IMUL_R_R(right->reg, node->reg);
+}
+
+static void
+mul_const_expr(struct ast_node *node, struct ast_node *left, struct ast_node *right)
+{
+    node->reg = right->reg;
+    IMUL_I_R(left->value, node->reg);
+}
+
+static void
+mul_const_var(struct ast_node *node, struct ast_node *left, struct ast_node *right)
+{
+    node->reg = new_register();
+    IMUL_I_R_R(left->value, right->reg, node->reg);
+}
+
+static void
+mul_expr_expr(struct ast_node *node, struct ast_node *left, struct ast_node *right)
+{
+    node->reg = left->reg;
+    IMUL_R_R(right->reg, node->reg);
+    free_register(right->reg);
+}
+
+static void
+mul_expr_var(struct ast_node *node, struct ast_node *left, struct ast_node *right)
+{
+    node->reg = left->reg;
+    IMUL_R_R(right->reg, node->reg);
+}
+
+static void
+mul_var_var(struct ast_node *node, struct ast_node *left, struct ast_node *right)
+{
+    node->reg = new_register();
+    MOV_R_R(left->reg, node->reg);
+    IMUL_R_R(right->reg, node->reg);
+}
+
+/* or */
+
+static void
+or_bigconst_expr(struct ast_node *node, struct ast_node *left, struct ast_node *right)
+{
+    int r = new_register();
+    node->reg = right->reg;
+    MOV_I_R(left->value, r);
+    OR_R_R(r, node->reg);
+    free_register(r);
+}
+
+static void
+or_const_expr(struct ast_node *node, struct ast_node *left, struct ast_node *right)
+{
+    node->reg = right->reg;
+    OR_I_R(left->value, node->reg);
+}
+
+static void
+or_const_var(struct ast_node *node, struct ast_node *left, struct ast_node *right)
+{
+    node->reg = new_register();
+    MOV_I_R(left->value, node->reg);
+    OR_R_R(right->reg, node->reg);
+}
+
+static void
+or_expr_expr(struct ast_node *node, struct ast_node *left, struct ast_node *right)
+{
+    node->reg = left->reg;
+    OR_R_R(right->reg, node->reg);
+    free_register(right->reg);
+}
+
+static void
+or_expr_var(struct ast_node *node, struct ast_node *left, struct ast_node *right)
+{
+    node->reg = left->reg;
+    OR_R_R(right->reg, node->reg);
+}
+
+static void
+or_var_var(struct ast_node *node, struct ast_node *left, struct ast_node *right)
+{
+    node->reg = new_register();
+    MOV_R_R(left->reg, node->reg);
+    OR_R_R(right->reg, node->reg);
+}
+
+/* eq */
+
+static void
+eq_bigconst_expr(struct ast_node *node, struct ast_node *left, struct ast_node *right)
+{
+    int reg = new_register();
+    node->reg = right->reg;
+    MOV_I_R(left->value, reg);
+    SUB_R_R(reg, node->reg);
+    CMOVNE_1_R(node->reg);
+    DEC_R(node->reg);
+    free_register(reg);
+}
+
+static void
+eq_const_expr(struct ast_node *node, struct ast_node *left, struct ast_node *right)
+{
+    node->reg = right->reg;
+    SUB_I_R(left->value, node->reg);
+    CMOVNE_1_R(node->reg);
+    DEC_R(node->reg);
+}
+
+static void
+eq_const_var(struct ast_node *node, struct ast_node *left, struct ast_node *right)
+{
+    node->reg = new_register();
+    MOV_I_R(left->value, node->reg);
+    SUB_R_R(right->reg, node->reg);
+    CMOVNE_1_R(node->reg);
+    DEC_R(node->reg);
+}
+
+static void
+eq_expr_expr(struct ast_node *node, struct ast_node *left, struct ast_node *right)
+{
+    node->reg = left->reg;
+    SUB_R_R(right->reg, node->reg);
+    CMOVNE_1_R(node->reg);
+    DEC_R(node->reg);
+    free_register(right->reg);
+}
+
+static void
+eq_expr_var(struct ast_node *node, struct ast_node *left, struct ast_node *right)
+{
+    node->reg = left->reg;
+    SUB_R_R(right->reg, node->reg);
+    CMOVNE_1_R(node->reg);
+    DEC_R(node->reg);
+}
+
+static void
+eq_var_var(struct ast_node *node, struct ast_node *left, struct ast_node *right)
+{
+    node->reg = new_register();
+    MOV_R_R(left->reg, node->reg);
+    SUB_R_R(right->reg, node->reg);
+    CMOVNE_1_R(node->reg);
+    DEC_R(node->reg);
+}
+
+/* lt */
+
+static void
+lt_bigconst_expr(struct ast_node *node, struct ast_node *left, struct ast_node *right, bool invert)
+{
+    int r = new_register();
+    node->reg = right->reg;
+    MOV_I_R(left->value, r);
+    CMP_R_R(r, node->reg);
+    MOV_I_R(0L, node->reg);
+    if (invert) {
+        CMOVL_neg1_R(node->reg);
+    } else {
+        CMOVG_neg1_R(node->reg);
+    }
+    free_register(r);
+}
+
+static void
+lt_bigconst_var(struct ast_node *node, struct ast_node *left, struct ast_node *right, bool invert)
+{
+    node->reg = new_register();
+    MOV_I_R(left->value, node->reg);
+    CMP_R_R(node->reg, right->reg);
+    MOV_I_R(0L, node->reg);
+    if (invert) {
+        CMOVL_neg1_R(node->reg);
+    } else {
+        CMOVG_neg1_R(node->reg);
+    }
+}
+
+static void
+lt_const_expr(struct ast_node *node, struct ast_node *left, struct ast_node *right, bool invert)
+{
+    node->reg = right->reg;
+    CMP_I_R(left->value, node->reg);
+    MOV_I_R(0L, node->reg);
+    if (invert) {
+        CMOVL_neg1_R(node->reg);
+    } else {
+        CMOVG_neg1_R(node->reg);
+    }
+}
+
+static void
+lt_const_var(struct ast_node *node, struct ast_node *left, struct ast_node *right, bool invert)
+{
+    node->reg = new_register();
+    CMP_I_R(left->value, right->reg);
+    MOV_I_R(0L, node->reg);
+    if (invert) {
+        CMOVL_neg1_R(node->reg);
+    } else {
+        CMOVG_neg1_R(node->reg);
+    }
+}
+
+static void
+lt_expr_expr(struct ast_node *node, struct ast_node *left, struct ast_node *right, bool invert)
+{
+    node->reg = left->reg;
+    CMP_R_R(node->reg, right->reg);
+    MOV_I_R(0L, node->reg);
+    if (invert) {
+        CMOVL_neg1_R(node->reg);
+    } else {
+        CMOVG_neg1_R(node->reg);
+    }
+    free_register(right->reg);
+}
+
+static void
+lt_expr_var(struct ast_node *node, struct ast_node *left, struct ast_node *right, bool invert)
+{
+    node->reg = left->reg;
+    CMP_R_R(node->reg, right->reg);
+    MOV_I_R(0L, node->reg);
+    if (invert) {
+        CMOVL_neg1_R(node->reg);
+    } else {
+        CMOVG_neg1_R(node->reg);
+    }
+}
+
+static void
+lt_var_var(struct ast_node *node, struct ast_node *left, struct ast_node *right, bool invert)
+{
+    node->reg = new_register();
+    CMP_R_R(left->reg, right->reg);
+    MOV_I_R(0L, node->reg);
+    if (invert) {
+        CMOVL_neg1_R(node->reg);
+    } else {
+        CMOVG_neg1_R(node->reg);
+    }
+}
+
+/* neg */
+
+static void
+neg_expr(struct ast_node *node, struct ast_node *child)
+{
+    node->reg = child->reg;
+    NEG_R(node->reg);
+}
+
+static void
+neg_var(struct ast_node *node, struct ast_node *child)
+{
+    node->reg = new_register();
+    IMUL_I_R_R(-1L, child->reg, node->reg);
+}
+
+/* not */
+
+static void
+not_expr(struct ast_node *node, struct ast_node *child)
+{
+    node->reg = child->reg;
+    NOT_R(node->reg);
+}
+
+static void
+not_var(struct ast_node *node, struct ast_node *child)
+{
+    node->reg = new_register();
+    MOV_R_R(child->reg, node->reg);
+    NOT_R(node->reg);
+}
+
+/* read */
+
+static void
+read_const(struct ast_node *node, struct ast_node *child)
+{
+    node->reg = new_register();
+    MOV_MI_R(child->value, node->reg);
+}
+
+static void
+read_expr(struct ast_node *node, struct ast_node *child)
+{
+    node->reg = child->reg;
+    MOV_MR_R(child->reg, node->reg);
+}
+
+static void
+read_var(struct ast_node *node, struct ast_node *child)
+{
+    node->reg = new_register();
+    MOV_MR_R(child->reg, node->reg);
+}
+
+static void
+read_add_const_var(struct ast_node *node, struct ast_node *left, struct ast_node *right)
+{
+    node->reg = new_register();
+    MOV_MIR_R(left->value, right->reg, node->reg);
+}
+
+static void
+read_add_const_expr(struct ast_node *node, struct ast_node *left, struct ast_node *right)
+{
+    node->reg = right->reg;
+    MOV_MIR_R(left->value, right->reg, node->reg);
+}
+
+static void
+read_add_expr_expr(struct ast_node *node, struct ast_node *left, struct ast_node *right)
+{
+    node->reg = left->reg;
+    MOV_MRR_R(left->reg, right->reg, node->reg);
+    free_register(right->reg);
+}
+
+static void
+read_add_expr_var(struct ast_node *node, struct ast_node *left, struct ast_node *right)
+{
+    node->reg = left->reg;
+    MOV_MRR_R(left->reg, right->reg, node->reg);
+}
+
+static void
+read_add_var_var(struct ast_node *node, struct ast_node *left, struct ast_node *right)
+{
+    node->reg = new_register();
+    MOV_MRR_R(left->reg, right->reg, node->reg);
+}
+
+/* write */
+
+static void
+write_bigconst_bigconst(struct ast_node *left, struct ast_node *right)
+{
+    int r1 = new_register();
+    int r2 = new_register();
+    MOV_I_R(left->value, r1);
+    MOV_I_R(right->value, r2);
+    MOV_R_MR(r2, r1);
+    free_register(r2);
+    free_register(r1);
+}
+
+static void
+write_bigconst_const(struct ast_node *left, struct ast_node *right)
+{
+    int r = new_register();
+    MOV_I_R(left->value, r);
+    MOV_I_MR(right->value, r);
+    free_register(r);
+}
+
+static void
+write_bigconst_expr(struct ast_node *left, struct ast_node *right)
+{
+    int r = new_register();
+    MOV_I_R(left->value, r);
+    MOV_R_MR(right->reg, r);
+    if (right->operator != OP_VAR) {
+        free_register(right->reg);
+    }
+    free_register(r);
+}
+
+static void
+write_const_bigconst(struct ast_node *left, struct ast_node *right)
+{
+    int r = new_register();
+    MOV_I_R(right->value, r);
+    MOV_R_MI(r, left->value);
+    free_register(r);
+}
+
+static void
+write_const_expr(struct ast_node *left, struct ast_node *right)
+{
+    MOV_R_MI(right->reg, left->value);
+    if (right->operator != OP_VAR) {
+        free_register(right->reg);
+    }
+}
+
+static void
+write_expr_bigconst(struct ast_node *left, struct ast_node *right)
+{
+    int r = new_register();
+    MOV_I_R(right->value, r);
+    MOV_R_MR(r, left->reg);
+    if (left->operator != OP_VAR) {
+        free_register(left->reg);
+    }
+    free_register(r);
+}
+
+static void
+write_expr_const(struct ast_node *left, struct ast_node *right)
+{
+    MOV_I_MR(right->value, left->reg);
+    if (left->operator != OP_VAR) {
+        free_register(left->reg);
+    }
+}
+
+static void
+write_expr_expr(struct ast_node *left, struct ast_node *right)
+{
+    MOV_R_MR(right->reg, left->reg);
+    if (left->operator != OP_VAR) {
+        free_register(left->reg);
+    }
+    if (right->operator != OP_VAR) {
+        free_register(right->reg);
+    }
+}
+
+static void
+write_add_const_expr_expr(struct ast_node *left_left, struct ast_node *left_right, struct ast_node *right)
+{
+    MOV_R_MIR(right->reg, left_left->value, left_right->reg);
+    if (left_right->operator != OP_VAR) {
+        free_register(left_right->reg);
+    }
+    if (right->operator != OP_VAR) {
+        free_register(right->reg);
+    }
+}
+
+static void
+write_add_expr_expr_expr(struct ast_node *left_left, struct ast_node *left_right, struct ast_node *right)
+{
+    MOV_R_MRR(right->reg, left_left->reg, left_right->reg);
+    if (left_left->operator != OP_VAR) {
+        free_register(left_left->reg);
+    }
+    if (left_right->operator != OP_VAR) {
+        free_register(left_right->reg);
+    }
+    if (right->operator != OP_VAR) {
+        free_register(right->reg);
+    }
+}
+
+static void
+write_add_const_expr_const(struct ast_node *left_left, struct ast_node *left_right, struct ast_node *right)
+{
+    MOV_I_MIR(right->value, left_left->value, left_right->reg);
+    if (left_right->operator != OP_VAR) {
+        free_register(left_right->reg);
+    }
+}
+
+static void
+write_add_expr_expr_const(struct ast_node *left_left, struct ast_node *left_right, struct ast_node *right)
+{
+    MOV_I_MRR(right->value, left_left->reg, left_right->reg);
+    if (left_left->operator != OP_VAR) {
+        free_register(left_left->reg);
+    }
+    if (left_right->operator != OP_VAR) {
+        free_register(left_right->reg);
+    }
+}
+
+/* jmpne */
+
+static void
+jmpne_const_expr(struct ast_node *node, struct ast_node *left, struct ast_node *right)
+{
+    CMP_I_R(left->value, right->reg);
+    JNE(NULL, node->value, true);
+}
+
+static void
+jmpne_expr_expr(struct ast_node *node, struct ast_node *left, struct ast_node *right)
+{
+    CMP_R_R(left->reg, right->reg);
+    JNE(NULL, node->value, true);
+}
+
+/* jmpnl */
+
+static void
+jmpnl_const_expr(struct ast_node *node, struct ast_node *left, struct ast_node *right, bool invert)
+{
+    CMP_I_R(left->value, right->reg);
+    if (invert) {
+        JNL(NULL, node->value, true);
+    } else {
+        JNG(NULL, node->value, true);
+    }
+}
+
+static void
+jmpnl_expr_expr(struct ast_node *node, struct ast_node *left, struct ast_node *right)
+{
+    CMP_R_R(right->reg, left->reg);
+    JNL(NULL, node->value, true);
+}
+
+%}
+
+%start expr
+%term ADD=1 BIGCONST=2 CONST=3 EQ=4 JMPNE=5 JMPNL=6 LT=7 MUL=8 NEG=9 NOT=10 OR=11 READ=12 VAR=13 WRITE=14
+
+%%
+
+expr: ADD(bigconst, expr)            # 10 # add_bigconst_expr(bnode, kids[0], kids[1]);
+expr: ADD(bigconst, var)             # 10 # add_bigconst_var(bnode, kids[0], kids[1]);
+expr: ADD(const, expr)               # 10 # add_const_expr(bnode, kids[0], kids[1]);
+expr: ADD(const, var)                # 10 # add_const_var(bnode, kids[0], kids[1]);
+expr: ADD(expr, bigconst)            # 10 # add_bigconst_expr(bnode, kids[1], kids[0]);
+expr: ADD(expr, const)               # 10 # add_const_expr(bnode, kids[1], kids[0]);
+expr: ADD(expr, expr)                # 10 # add_expr_expr(bnode, kids[0], kids[1]);
+expr: ADD(expr, var)                 # 10 # add_expr_var(bnode, kids[0], kids[1]);
+expr: ADD(var, bigconst)             # 10 # add_bigconst_var(bnode, kids[1], kids[0]);
+expr: ADD(var, const)                # 10 # add_const_var(bnode, kids[1], kids[0]);
+expr: ADD(var, expr)                 # 10 # add_expr_var(bnode, kids[1], kids[0]);
+expr: ADD(var, var)                  # 10 # add_var_var(bnode, kids[0], kids[1]);
+
+expr: MUL(bigconst, expr)            # 10 # mul_bigconst_expr(bnode, kids[0], kids[1]);
+expr: MUL(bigconst, var)             # 10 # mul_bigconst_var(bnode, kids[0], kids[1]);
+expr: MUL(const, expr)               # 10 # mul_const_expr(bnode, kids[0], kids[1]);
+expr: MUL(const, var)                # 10 # mul_const_var(bnode, kids[0], kids[1]);
+expr: MUL(expr, bigconst)            # 10 # mul_bigconst_expr(bnode, kids[1], kids[0]);
+expr: MUL(expr, const)               # 10 # mul_const_expr(bnode, kids[1], kids[0]);
+expr: MUL(expr, expr)                # 10 # mul_expr_expr(bnode, kids[0], kids[1]);
+expr: MUL(expr, var)                 # 10 # mul_expr_var(bnode, kids[0], kids[1]);
+expr: MUL(var, bigconst)             # 10 # mul_bigconst_var(bnode, kids[1], kids[0]);
+expr: MUL(var, const)                # 10 # mul_const_var(bnode, kids[1], kids[0]);
+expr: MUL(var, expr)                 # 10 # mul_expr_var(bnode, kids[1], kids[0]);
+expr: MUL(var, var)                  # 10 # mul_var_var(bnode, kids[0], kids[1]);
+
+expr: OR(bigconst, expr)             # 10 # or_bigconst_expr(bnode, kids[0], kids[1]);
+expr: OR(bigconst, var)              # 10 # or_const_var(bnode, kids[0], kids[1]);
+expr: OR(const, expr)                # 10 # or_const_expr(bnode, kids[0], kids[1]);
+expr: OR(const, var)                 # 10 # or_const_var(bnode, kids[0], kids[1]);
+expr: OR(expr, bigconst)             # 10 # or_bigconst_expr(bnode, kids[1], kids[0]);
+expr: OR(expr, const)                # 10 # or_const_expr(bnode, kids[1], kids[0]);
+expr: OR(expr, expr)                 # 10 # or_expr_expr(bnode, kids[0], kids[1]);
+expr: OR(expr, var)                  # 10 # or_expr_var(bnode, kids[0], kids[1]);
+expr: OR(var, bigconst)              # 10 # or_const_var(bnode, kids[1], kids[0]);
+expr: OR(var, const)                 # 10 # or_const_var(bnode, kids[1], kids[0]);
+expr: OR(var, expr)                  # 10 # or_expr_var(bnode, kids[1], kids[0]);
+expr: OR(var, var)                   # 10 # or_var_var(bnode, kids[0], kids[1]);
+
+expr: EQ(bigconst, expr)             # 10 # eq_bigconst_expr(bnode, kids[0], kids[1]);
+expr: EQ(bigconst, var)              # 10 # eq_const_var(bnode, kids[0], kids[1]);
+expr: EQ(const, expr)                # 10 # eq_const_expr(bnode, kids[0], kids[1]);
+expr: EQ(const, var)                 # 10 # eq_const_var(bnode, kids[0], kids[1]);
+expr: EQ(expr, bigconst)             # 10 # eq_bigconst_expr(bnode, kids[1], kids[0]);
+expr: EQ(expr, const)                # 10 # eq_const_expr(bnode, kids[1], kids[0]);
+expr: EQ(expr, expr)                 # 10 # eq_expr_expr(bnode, kids[0], kids[1]);
+expr: EQ(expr, var)                  # 10 # eq_expr_var(bnode, kids[0], kids[1]);
+expr: EQ(var, bigconst)              # 10 # eq_const_var(bnode, kids[1], kids[0]);
+expr: EQ(var, const)                 # 10 # eq_const_var(bnode, kids[1], kids[0]);
+expr: EQ(var, expr)                  # 10 # eq_expr_var(bnode, kids[1], kids[0]);
+expr: EQ(var, var)                   # 10 # eq_var_var(bnode, kids[0], kids[1]);
+
+expr: LT(bigconst, expr)             # 10 # lt_bigconst_expr(bnode, kids[0], kids[1], false);
+expr: LT(bigconst, var)              # 10 # lt_bigconst_var(bnode, kids[0], kids[1], false);
+expr: LT(const, expr)                # 10 # lt_const_expr(bnode, kids[0], kids[1], false);
+expr: LT(const, var)                 # 10 # lt_const_var(bnode, kids[0], kids[1], false);
+expr: LT(expr, bigconst)             # 10 # lt_bigconst_expr(bnode, kids[1], kids[0], true);
+expr: LT(expr, const)                # 10 # lt_const_expr(bnode, kids[1], kids[0], true);
+expr: LT(expr, expr)                 # 10 # lt_expr_expr(bnode, kids[0], kids[1], false);
+expr: LT(expr, var)                  # 10 # lt_expr_var(bnode, kids[0], kids[1], false);
+expr: LT(var, bigconst)              # 10 # lt_bigconst_var(bnode, kids[1], kids[0], true);
+expr: LT(var, const)                 # 10 # lt_const_var(bnode, kids[1], kids[0], true);
+expr: LT(var, expr)                  # 10 # lt_expr_var(bnode, kids[1], kids[0], true);
+expr: LT(var, var)                   # 10 # lt_var_var(bnode, kids[0], kids[1], false);
+
+expr: NEG(expr)                      # 10 # neg_expr(bnode, kids[0]);
+expr: NEG(var)                       # 10 # neg_var(bnode, kids[0]);
+
+expr: NOT(expr)                      # 10 # not_expr(bnode, kids[0]);
+expr: NOT(var)                       # 10 # not_var(bnode, kids[0]);
+
+expr: READ(const)                    # 10 # read_const(bnode, kids[0]);
+expr: READ(expr)                     # 10 # read_expr(bnode, kids[0]);
+expr: READ(var)                      # 10 # read_var(bnode, kids[0]);
+
+expr: READ(ADD(const, expr))         # 1 # read_add_const_expr(bnode, kids[0], kids[1]);
+expr: READ(ADD(const, var))          # 1 # read_add_const_var(bnode, kids[0], kids[1]);
+expr: READ(ADD(expr, const))         # 1 # read_add_const_expr(bnode, kids[1], kids[0]);
+expr: READ(ADD(expr, expr))          # 1 # read_add_expr_expr(bnode, kids[0], kids[1]);
+expr: READ(ADD(expr, var))           # 1 # read_add_expr_var(bnode, kids[0], kids[1]);
+expr: READ(ADD(var, const))          # 1 # read_add_const_var(bnode, kids[1], kids[0]);
+expr: READ(ADD(var, expr))           # 1 # read_add_expr_var(bnode, kids[1], kids[0]);
+expr: READ(ADD(var, var))            # 1 # read_add_var_var(bnode, kids[0], kids[1]);
+
+expr: WRITE(bigconst, bigconst)      # 10 # write_bigconst_bigconst(kids[0], kids[1]);
+expr: WRITE(bigconst, const)         # 10 # write_bigconst_const(kids[0], kids[1]);
+expr: WRITE(bigconst, expr)          # 10 # write_bigconst_expr(kids[0], kids[1]);
+expr: WRITE(const, bigconst)         # 10 # write_const_bigconst(kids[0], kids[1]);
+expr: WRITE(const, const)            # 10 # write_const_bigconst(kids[0], kids[1]);
+expr: WRITE(const, expr)             # 10 # write_const_expr(kids[0], kids[1]);
+expr: WRITE(expr, bigconst)          # 10 # write_expr_bigconst(kids[0], kids[1]);
+expr: WRITE(expr, const)             # 10 # write_expr_const(kids[0], kids[1]);
+expr: WRITE(expr, expr)              # 10 # write_expr_expr(kids[0], kids[1]);
+
+expr: WRITE(ADD(const, expr), const) # 1 # write_add_const_expr_const(kids[0], kids[1], kids[2]);
+expr: WRITE(ADD(const, var), const)  # 1 # write_add_const_expr_const(kids[0], kids[1], kids[2]);
+expr: WRITE(ADD(expr, const), const) # 1 # write_add_const_expr_const(kids[1], kids[0], kids[2]);
+expr: WRITE(ADD(expr, expr), const)  # 1 # write_add_expr_expr_const(kids[0], kids[1], kids[2]);
+expr: WRITE(ADD(expr, var), const)   # 1 # write_add_expr_expr_const(kids[0], kids[1], kids[2]);
+expr: WRITE(ADD(var, const), const)  # 1 # write_add_const_expr_const(kids[1], kids[0], kids[2]);
+expr: WRITE(ADD(var, expr), const)   # 1 # write_add_expr_expr_const(kids[0], kids[1], kids[2]);
+expr: WRITE(ADD(var, var), const)    # 1 # write_add_expr_expr_const(kids[0], kids[1], kids[2]);
+
+expr: WRITE(ADD(const, expr), expr)  # 1 # write_add_const_expr_expr(kids[0], kids[1], kids[2]);
+expr: WRITE(ADD(const, var), expr)   # 1 # write_add_const_expr_expr(kids[0], kids[1], kids[2]);
+expr: WRITE(ADD(expr, const), expr)  # 1 # write_add_const_expr_expr(kids[1], kids[0], kids[2]);
+expr: WRITE(ADD(expr, expr), expr)   # 1 # write_add_expr_expr_expr(kids[0], kids[1], kids[2]);
+expr: WRITE(ADD(expr, var), expr)    # 1 # write_add_expr_expr_expr(kids[0], kids[1], kids[2]);
+expr: WRITE(ADD(var, const), expr)   # 1 # write_add_const_expr_expr(kids[1], kids[0], kids[2]);
+expr: WRITE(ADD(var, expr), expr)    # 1 # write_add_expr_expr_expr(kids[0], kids[1], kids[2]);
+expr: WRITE(ADD(var, var), expr)     # 1 # write_add_expr_expr_expr(kids[0], kids[1], kids[2]);
+
+expr: WRITE(ADD(const, expr), var)   # 1 # write_add_const_expr_expr(kids[0], kids[1], kids[2]);
+expr: WRITE(ADD(const, var), var)    # 1 # write_add_const_expr_expr(kids[0], kids[1], kids[2]);
+expr: WRITE(ADD(expr, const), var)   # 1 # write_add_const_expr_expr(kids[1], kids[0], kids[2]);
+expr: WRITE(ADD(expr, expr), var)    # 1 # write_add_expr_expr_expr(kids[0], kids[1], kids[2]);
+expr: WRITE(ADD(expr, var), var)     # 1 # write_add_expr_expr_expr(kids[0], kids[1], kids[2]);
+expr: WRITE(ADD(var, const), var)    # 1 # write_add_const_expr_expr(kids[1], kids[0], kids[2]);
+expr: WRITE(ADD(var, expr), var)     # 1 # write_add_expr_expr_expr(kids[0], kids[1], kids[2]);
+expr: WRITE(ADD(var, var), var)      # 1 # write_add_expr_expr_expr(kids[0], kids[1], kids[2]);
+
+expr: JMPNE(const, expr)             # 10 # jmpne_const_expr(bnode, kids[0], kids[1]);
+expr: JMPNE(expr, const)             # 10 # jmpne_const_expr(bnode, kids[1], kids[0]);
+expr: JMPNE(expr, expr)              # 10 # jmpne_expr_expr(bnode, kids[0], kids[1]);
+
+expr: JMPNL(const, expr)             # 10 # jmpnl_const_expr(bnode, kids[0], kids[1], false);
+expr: JMPNL(expr, const)             # 10 # jmpnl_const_expr(bnode, kids[1], kids[0], true);
+expr: JMPNL(expr, expr)              # 10 # jmpnl_expr_expr(bnode, kids[0], kids[1]);
+
+expr: bigconst                       # 100 #
+bigconst: BIGCONST                   # 0 #
+expr: const                          # 100 #
+const: CONST                         # 0 #
+expr: var                            # 100 #
+var:  VAR                            # 0 #
+
+%%
+
+void
+generate_control_pass(struct symbol *label, size_t depth, bool forward)
+{
+    if (label != NULL) {
+        JMP(label->string, label->counter, forward);
+    } else {
+        JMP(NULL, 2 * depth - 1, forward);
+    }
+}
+
+void
+generate_do_begin(struct symbol *label, size_t depth)
+{
+    if (label != NULL) {
+        printf(".%s_%zub:\n", label->string, label->counter);
+    }
+    printf("%zu:\n", 2 * depth + 1);
+}
+
+void
+generate_do_end(struct symbol *label, size_t depth)
+{
+    if (label != NULL) {
+        printf(".%s_%zuf:\n", label->string, label->counter);
+    }
+    printf("%zu:\n", 2 * depth + 1);
+    printf("%zu:\n", 2 * (depth + 1));
+}
+
+void
+generate_function_begin(const char *name)
+{
+    printf(".global %s\n", name);
+    printf(".type %s, @function\n", name);
+    printf("%s:\n", name);
+}
+
+void
+generate_function_end(const char *name)
+{
+    RET();
+    printf(".size %s, .-%s\n\n", name, name);
+}
+
+void
+generate_guarded(struct ast_node *expr, size_t depth, size_t used_regs)
+{
+    init_registers(used_regs, REG_RAX);
+    printf("%zu:\n", 2 * depth);
+    switch (expr->operator) {
+    case OP_BIGCONST:
+    case OP_CONST:
+        if (expr->value >= 0) {
+            JMP(NULL, 2 * depth, true);
+        }
+        break;
+    case OP_LT:
+        expr->operator = OP_JMPNL;
+        expr->value = 2 * depth;
+        burm_label(expr);
+        burm_reduce(expr, 1);
+        break;
+    case OP_EQ:
+        expr->operator = OP_JMPNE;
+        expr->value = 2 * depth;
+        burm_label(expr);
+        burm_reduce(expr, 1);
+        break;
+    default:
+        burm_label(expr);
+        burm_reduce(expr, 1);
+        TEST_R_R(expr->reg, expr->reg);
+        JNS(NULL, 2 * depth, true);
+        break;
+    }
+}
+
+void
+generate_return(struct ast_node *expr, size_t used_regs)
+{
+    generate_var_assignment(expr, REG_RAX, used_regs);
+    RET();
+    free_register(REG_RAX);
+}
+
+void
+generate_var_assignment(struct ast_node *expr, int reg, size_t used_regs)
+{
+    init_registers(used_regs, REG_RAX);
+    burm_label(expr);
+    burm_reduce(expr, 1);
+    if (IS_OP_CONST(expr)) {
+        MOV_I_R(expr->value, reg);
+    } else if (expr->reg != reg) {
+        MOV_R_R(expr->reg, reg);
+        free_register(expr->reg);
+    }
+}
+
+void
+generate_var_definition(struct ast_node *expr, size_t used_regs)
+{
+    int reg, r;
+    for (r = REG_START; r <= REG_END; ++r) {
+        if ((used_regs & (1 << r)) == 0) {
+            reg = r;
+            break;
+        }
+    }
+    init_registers(used_regs, reg);
+    burm_label(expr);
+    burm_reduce(expr, 1);
+    if (IS_OP_CONST(expr)) {
+        MOV_I_R(expr->value, reg);
+    } else if (expr->reg != reg) {
+        MOV_R_R(expr->reg, reg);
+        free_register(expr->reg);
+    }
+}
+
+void
+generate_write(struct ast_node *left, struct ast_node *right, size_t used_regs)
+{
+    struct ast_node *root;
+    assert(left != NULL);
+    assert(right != NULL);
+    init_registers(used_regs, REG_RAX);
+    root = ast_operator(OP_WRITE, left, right);
+    burm_label(root);
+    burm_reduce(root, 1);
+}
